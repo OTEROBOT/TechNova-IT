@@ -39,6 +39,10 @@ function ipv4Lookup(hostname, options, callback) {
 }
 
 // 1. ดึงค่า Config จากไฟล์ .env
+const BREVO_API_KEY = (process.env.BREVO_API_KEY || '').trim();
+const BREVO_SENDER_EMAIL = (process.env.BREVO_SENDER_EMAIL || process.env.GMAIL_USER || 'oterobot@gmail.com').trim();
+const BREVO_SENDER_NAME = (process.env.BREVO_SENDER_NAME || 'TechNova IT Store').trim();
+
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
 const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || 'TechNova IT <onboarding@resend.dev>').trim();
 const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
@@ -46,6 +50,7 @@ const gmailPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '')
 const SITE_URL = process.env.SITE_URL || 'http://localhost:3000';
 
 // 2. ตรวจสอบ Provider ที่พร้อมใช้งาน
+const isBrevoConfigured = Boolean(BREVO_API_KEY && !BREVO_API_KEY.includes('your_brevo'));
 const isResendConfigured = Boolean(RESEND_API_KEY && !RESEND_API_KEY.includes('your_resend'));
 const isSmtpConfigured =
   Boolean(GMAIL_USER) &&
@@ -54,14 +59,18 @@ const isSmtpConfigured =
   !gmailPassword.includes('your16digit') &&
   !gmailPassword.includes('xxxx');
 
-const isConfigured = isResendConfigured || isSmtpConfigured;
+const isConfigured = isBrevoConfigured || isResendConfigured || isSmtpConfigured;
 
-// 3. เตรียม Client ของ Resend (HTTPS Port 443 — 100% Cloud Compatible)
+if (isBrevoConfigured) {
+  console.log('✅ Brevo (Sendinblue) HTTPS REST API v3 configured (Port 443 — Universal Global Delivery).');
+}
+
+// 3. เตรียม Client ของ Resend (HTTPS Port 443 — Cloud Compatible)
 let resendClient = null;
 if (isResendConfigured) {
   try {
     resendClient = new Resend(RESEND_API_KEY);
-    console.log('✅ Resend HTTPS API Client initialized (Port 443 — 100% Cloud Compatible).');
+    console.log('✅ Resend HTTPS API Client initialized (Port 443 — Cloud Compatible).');
   } catch (err) {
     console.error('❌ Failed to initialize Resend client:', err.message);
   }
@@ -110,7 +119,53 @@ if (isSmtpConfigured) {
   });
 }
 
-// 5. Unified Dispatcher: ลำดับความสำคัญ 1) Resend HTTPS API -> 2) SMTP 465 -> 3) SMTP 587
+/**
+ * ส่งอีเมลผ่าน Brevo (Sendinblue) Transactional Emails HTTPS REST API v3
+ * Endpoint: POST https://api.brevo.com/v3/smtp/email
+ * ข้อดี: ส่งหาผู้รับได้ทั่วโลก (ไม่ติด sandbox), วิ่งผ่าน Port 443 HTTPS (ไม่โดนบล็อกพอร์ตบน Render)
+ */
+async function sendViaBrevoApi({ to, subject, html, recipientName }) {
+  if (!isBrevoConfigured) {
+    throw new Error('Brevo API key is not configured');
+  }
+
+  const cleanTo = (to || '').trim();
+  const payload = {
+    sender: {
+      name: BREVO_SENDER_NAME,
+      email: BREVO_SENDER_EMAIL,
+    },
+    to: [
+      {
+        email: cleanTo,
+        name: recipientName || cleanTo.split('@')[0] || 'Customer',
+      },
+    ],
+    subject: subject,
+    htmlContent: html,
+  };
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'api-key': BREVO_API_KEY,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const errMsg = data.message || `HTTP ${response.status} ${response.statusText}`;
+    throw new Error(`Brevo API Error: ${errMsg}`);
+  }
+
+  const messageId = data.messageId || 'brevo-ok';
+  return { success: true, messageId, provider: 'brevo' };
+}
+
+// 5. Unified Dispatcher: ลำดับความสำคัญ 1) Brevo HTTPS REST API -> 2) Resend HTTPS API -> 3) SMTP 465 -> 4) SMTP 587
 async function executeSendMail(mailOptions) {
   if (!isConfigured) {
     throw new Error('No email delivery provider configured');
@@ -119,11 +174,28 @@ async function executeSendMail(mailOptions) {
   const cleanTo = (mailOptions.to || '').trim();
   const subject = mailOptions.subject || 'TechNova IT Store Notice';
   const html = mailOptions.html || '';
-  const fromAddress = RESEND_FROM_EMAIL || mailOptions.from || `"TechNova IT Store" <${GMAIL_USER}>`;
+  const recipientName = mailOptions.recipientName || mailOptions.name || '';
 
-  // 🚀 Priority 1: Resend HTTPS API (Port 443 — NEVER BLOCKED ON RENDER)
+  // 🚀 Priority 1: Brevo HTTPS REST API v3 (Port 443 — Universal Global Delivery, NO Sandbox Restriction)
+  if (isBrevoConfigured) {
+    try {
+      const result = await sendViaBrevoApi({
+        to: cleanTo,
+        subject,
+        html,
+        recipientName,
+      });
+      console.log(`\n📬 [Brevo Mailer] Successfully delivered email to ${cleanTo} (Message ID: ${result.messageId})\n`);
+      return result;
+    } catch (brevoErr) {
+      console.warn(`⚠️ [Brevo API Error]: ${brevoErr.message}. Switching to fallback provider...`);
+    }
+  }
+
+  // 🚀 Priority 2: Resend HTTPS API (Port 443 — Cloud Compatible)
   if (resendClient) {
     try {
+      const fromAddress = RESEND_FROM_EMAIL || `"TechNova IT Store" <${GMAIL_USER}>`;
       const response = await resendClient.emails.send({
         from: fromAddress,
         to: cleanTo,
@@ -143,7 +215,7 @@ async function executeSendMail(mailOptions) {
     }
   }
 
-  // 🚀 Priority 2: SMTP Port 465 SSL (IPv4)
+  // 🚀 Priority 3: SMTP Port 465 SSL (IPv4)
   if (primaryTransporter) {
     try {
       const info = await primaryTransporter.sendMail(mailOptions);
@@ -160,7 +232,7 @@ async function executeSendMail(mailOptions) {
     }
   }
 
-  // 🚀 Priority 3: Fallback SMTP Port 587
+  // 🚀 Priority 4: Fallback SMTP Port 587
   if (fallbackTransporter) {
     const fInfo = await fallbackTransporter.sendMail(mailOptions);
     return { success: true, messageId: fInfo.messageId, provider: 'smtp-587' };
@@ -226,7 +298,7 @@ async function sendNewsletterWelcomeEmail(toEmail) {
     return { simulated: true, toEmail: cleanEmail };
   }
 
-  if (!isConfigured || (!primaryTransporter && !fallbackTransporter)) {
+  if (!isConfigured) {
     console.log('\n📧 [โหมดจำลอง - บันทึกอีเมลแล้ว]');
     console.log(`   ส่งอีเมลต้อนรับ Newsletter ไปยัง: ${cleanEmail}\n`);
     return { simulated: true, toEmail: cleanEmail };
@@ -548,7 +620,7 @@ async function sendRegistrationWelcomeEmail(toEmail, userName, preferences = {})
     return { simulated: true, toEmail: cleanEmail, profile: showcase.profileLabel };
   }
 
-  if (!isConfigured || (!primaryTransporter && !fallbackTransporter)) {
+  if (!isConfigured) {
     console.log('\n📧 [โหมดจำลอง - สมัครสมาชิกใหม่]');
     console.log(`   ส่งอีเมลต้อนรับการสมัครสมาชิกไปยัง: ${cleanEmail} (${displayName})\n`);
     return { simulated: true, toEmail: cleanEmail, profile: showcase.profileLabel };
@@ -725,8 +797,8 @@ async function sendRegistrationWelcomeEmail(toEmail, userName, preferences = {})
 async function sendResetPasswordEmail(toEmail, resetToken) {
   const resetLink = `${SITE_URL}/#/reset-password?token=${resetToken}`;
 
-  if (!isConfigured || (!primaryTransporter && !fallbackTransporter)) {
-    console.log('\n📧 [โหมดจำลอง - ยังไม่ได้ตั้งค่า Gmail ใน .env]');
+  if (!isConfigured) {
+    console.log('\n📧 [โหมดจำลอง - ยังไม่ได้ตั้งค่าระบบส่งอีเมลใน .env]');
     console.log(`   ลิงก์รีเซ็ตรหัสผ่านสำหรับ ${toEmail}:`);
     console.log(`   ${resetLink}\n`);
     return { simulated: true, resetLink };
@@ -806,7 +878,7 @@ async function sendOrderConfirmationEmail({
   const customerName = name || 'VIP Client';
   const orderNum = `#TN-${String(orderId).padStart(5, '0')}`;
 
-  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || (!primaryTransporter && !fallbackTransporter)) {
+  if (isTestOrDummyEmail(cleanEmail) || !isConfigured) {
     console.log(`\n📧 [Email Simulation] Order Confirmation for ${cleanEmail} (Order: ${orderNum}, Total: ฿${total.toLocaleString()})`);
     return { simulated: true, toEmail: cleanEmail, orderId };
   }
@@ -970,7 +1042,7 @@ async function sendOrderShippedEmail({
   const customerName = name || 'VIP Client';
   const orderNum = `#TN-${String(orderId).padStart(5, '0')}`;
 
-  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || (!primaryTransporter && !fallbackTransporter)) {
+  if (isTestOrDummyEmail(cleanEmail) || !isConfigured) {
     console.log(`\n📧 [Email Simulation] Order Shipped for ${cleanEmail} (Order: ${orderNum}, Tracking: ${trackingNumber})`);
     return { simulated: true, toEmail: cleanEmail, orderId, trackingNumber };
   }
@@ -1074,7 +1146,7 @@ async function sendCampaignEmail({
   const cleanEmail = toEmail.trim().toLowerCase();
   const recipientName = name || 'VIP Member';
 
-  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || (!primaryTransporter && !fallbackTransporter)) {
+  if (isTestOrDummyEmail(cleanEmail) || !isConfigured) {
     console.log(`\n📧 [Campaign Simulation] To: ${cleanEmail} | Subject: "${subject}" | Tracking CTA: ${ctaTrackingUrl}`);
     return { simulated: true, toEmail: cleanEmail, subject };
   }
