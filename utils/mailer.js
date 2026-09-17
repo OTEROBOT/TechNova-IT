@@ -26,27 +26,46 @@
 
 const nodemailer = require('nodemailer');
 
-// 1. ดึงค่า Config จากไฟล์ .env
-const GMAIL_USER = process.env.GMAIL_USER;
-const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+// 1. ดึงค่า Config จากไฟล์ .env และกำจัดช่องว่าง (Whitespace) ออกจากรหัสผ่านอัตโนมัติ
+const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
+const gmailPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
 const SITE_URL = process.env.SITE_URL || 'http://localhost:3000';
 
-// 2. ตรวจสอบว่าได้ตั้งค่า Gmail ใน .env ถูกต้องหรือไม่
+// 2. ตรวจสอบความถูกต้องของการตั้งค่า Gmail
 const isConfigured =
-  GMAIL_USER &&
-  GMAIL_APP_PASSWORD &&
+  Boolean(GMAIL_USER) &&
+  Boolean(gmailPassword) &&
   !GMAIL_USER.includes('your-email') &&
-  !GMAIL_APP_PASSWORD.includes('your16digit');
+  !gmailPassword.includes('your16digit') &&
+  !gmailPassword.includes('xxxx');
 
-// 3. สร้างตัวส่งอีเมล (Transporter) ผ่าน Gmail SMTP
+// 3. สร้างตัวส่งอีเมล (Transporter) พร้อม SSL Port 465 และ Timeout สำหรับ Render / Cloud Hosting
 let transporter = null;
 if (isConfigured) {
   transporter = nodemailer.createTransport({
     service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true, // บังคับใช้ SSL บน Port 465 สำหรับ Cloud Hosting / Production
     auth: {
-      user: GMAIL_USER.trim(),
-      pass: GMAIL_APP_PASSWORD.replace(/\s+/g, ''), // ลบ space 16 หลักออกให้อัตโนมัติ
+      user: GMAIL_USER,
+      pass: gmailPassword,
     },
+    tls: {
+      rejectUnauthorized: false, // ป้องกันปัญหา SSL Certificate Dropouts
+    },
+    connectionTimeout: 15000, // 15 seconds timeout
+    greetingTimeout: 15000,
+    socketTimeout: 15000,
+  });
+
+  // ตรวจสอบการเชื่อมต่อ SMTP บน Server Boot
+  transporter.verify((error, success) => {
+    if (error) {
+      console.error('❌ Nodemailer Transporter Error:', error.message);
+    } else {
+      console.log('✅ Nodemailer Transporter is ready to send emails via Port 465 (SSL).');
+    }
   });
 }
 
