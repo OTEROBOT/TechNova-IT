@@ -24,6 +24,7 @@
  * ============================================================================
  */
 
+const { Resend } = require('resend');
 const nodemailer = require('nodemailer');
 const dns = require('dns');
 
@@ -37,30 +38,46 @@ function ipv4Lookup(hostname, options, callback) {
   return dns.lookup(hostname, { family: 4, all: false }, callback);
 }
 
-// 1. ดึงค่า Config จากไฟล์ .env และกำจัดช่องว่าง (Whitespace) ออกจากรหัสผ่านอัตโนมัติ
+// 1. ดึงค่า Config จากไฟล์ .env
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
+const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || 'TechNova IT <onboarding@resend.dev>').trim();
 const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
 const gmailPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
 const SITE_URL = process.env.SITE_URL || 'http://localhost:3000';
 
-// 2. ตรวจสอบความถูกต้องของการตั้งค่า Gmail
-const isConfigured =
+// 2. ตรวจสอบ Provider ที่พร้อมใช้งาน
+const isResendConfigured = Boolean(RESEND_API_KEY && !RESEND_API_KEY.includes('your_resend'));
+const isSmtpConfigured =
   Boolean(GMAIL_USER) &&
   Boolean(gmailPassword) &&
   !GMAIL_USER.includes('your-email') &&
   !gmailPassword.includes('your16digit') &&
   !gmailPassword.includes('xxxx');
 
-// 3. สร้างตัวส่งอีเมล (Primary: Port 465 SSL | Fallback: Port 587 STARTTLS) พร้อม Strict IPv4
+const isConfigured = isResendConfigured || isSmtpConfigured;
+
+// 3. เตรียม Client ของ Resend (HTTPS Port 443 — 100% Cloud Compatible)
+let resendClient = null;
+if (isResendConfigured) {
+  try {
+    resendClient = new Resend(RESEND_API_KEY);
+    console.log('✅ Resend HTTPS API Client initialized (Port 443 — 100% Cloud Compatible).');
+  } catch (err) {
+    console.error('❌ Failed to initialize Resend client:', err.message);
+  }
+}
+
+// 4. เตรียม SMTP Transporter (Fallback)
 let primaryTransporter = null;
 let fallbackTransporter = null;
 
-if (isConfigured) {
+if (isSmtpConfigured) {
   // Primary: Port 465 SSL with IPv4 Lookup
   primaryTransporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 465,
     secure: true,
-    lookup: ipv4Lookup, // 👈 บังคับใช้ IPv4 ผ่าน DNS lookup function
+    lookup: ipv4Lookup,
     auth: {
       user: GMAIL_USER,
       pass: gmailPassword,
@@ -79,7 +96,7 @@ if (isConfigured) {
     port: 587,
     secure: false,
     requireTLS: true,
-    lookup: ipv4Lookup, // 👈 บังคับใช้ IPv4 ผ่าน DNS lookup function
+    lookup: ipv4Lookup,
     auth: {
       user: GMAIL_USER,
       pass: gmailPassword,
@@ -91,51 +108,65 @@ if (isConfigured) {
     greetingTimeout: 15000,
     socketTimeout: 15000,
   });
-
-  // ตรวจสอบการเชื่อมต่อ SMTP บน Server Boot
-  primaryTransporter.verify((error) => {
-    if (error) {
-      console.warn('⚠️ Nodemailer Primary (Port 465 SSL) notice:', error.message);
-      if (fallbackTransporter) {
-        fallbackTransporter.verify((fErr) => {
-          if (fErr) {
-            console.error('❌ Nodemailer Fallback (Port 587 STARTTLS) error:', fErr.message);
-          } else {
-            console.log('✅ Nodemailer Fallback Transporter is ready via Port 587 (IPv4 STARTTLS).');
-          }
-        });
-      }
-    } else {
-      console.log('✅ Nodemailer Transporter is ready to send emails via Port 465 (IPv4 SSL).');
-    }
-  });
 }
 
-// Unified Dispatcher with automatic Port 465 -> Port 587 IPv4 Fallback
+// 5. Unified Dispatcher: ลำดับความสำคัญ 1) Resend HTTPS API -> 2) SMTP 465 -> 3) SMTP 587
 async function executeSendMail(mailOptions) {
   if (!isConfigured) {
-    throw new Error('Email service is not configured');
+    throw new Error('No email delivery provider configured');
   }
 
-  // Attempt 1: Port 465 (SSL IPv4)
-  if (primaryTransporter) {
+  const cleanTo = (mailOptions.to || '').trim();
+  const subject = mailOptions.subject || 'TechNova IT Store Notice';
+  const html = mailOptions.html || '';
+  const fromAddress = RESEND_FROM_EMAIL || mailOptions.from || `"TechNova IT Store" <${GMAIL_USER}>`;
+
+  // 🚀 Priority 1: Resend HTTPS API (Port 443 — NEVER BLOCKED ON RENDER)
+  if (resendClient) {
     try {
-      return await primaryTransporter.sendMail(mailOptions);
-    } catch (primaryErr) {
-      console.warn(`⚠️ [Mailer] Primary Port 465 attempt failed (${primaryErr.message}). Retrying via Port 587 (IPv4 STARTTLS)...`);
-      if (fallbackTransporter) {
-        return await fallbackTransporter.sendMail(mailOptions);
+      const response = await resendClient.emails.send({
+        from: fromAddress,
+        to: cleanTo,
+        subject: subject,
+        html: html,
+      });
+
+      if (response.error) {
+        console.warn(`⚠️ [Resend Error]: ${response.error.message}. Switching to SMTP fallback...`);
+      } else {
+        const id = response.data?.id || response.id || 'resend-ok';
+        console.log(`\n📬 [Resend Mailer] Successfully delivered email to ${cleanTo} (ID: ${id})\n`);
+        return { success: true, messageId: id, provider: 'resend' };
       }
-      throw primaryErr;
+    } catch (resendErr) {
+      console.warn(`⚠️ [Resend Exception]: ${resendErr.message}. Switching to SMTP fallback...`);
     }
   }
 
-  // Attempt 2: Fallback Port 587
-  if (fallbackTransporter) {
-    return await fallbackTransporter.sendMail(mailOptions);
+  // 🚀 Priority 2: SMTP Port 465 SSL (IPv4)
+  if (primaryTransporter) {
+    try {
+      const info = await primaryTransporter.sendMail(mailOptions);
+      console.log(`\n📬 [SMTP Mailer] Successfully delivered email via Port 465 to ${cleanTo}\n`);
+      return { success: true, messageId: info.messageId, provider: 'smtp-465' };
+    } catch (smtpErr) {
+      console.warn(`⚠️ [SMTP 465 Failed]: ${smtpErr.message}. Switching to Port 587...`);
+      if (fallbackTransporter) {
+        const fInfo = await fallbackTransporter.sendMail(mailOptions);
+        console.log(`\n📬 [SMTP Mailer] Successfully delivered email via Port 587 to ${cleanTo}\n`);
+        return { success: true, messageId: fInfo.messageId, provider: 'smtp-587' };
+      }
+      throw smtpErr;
+    }
   }
 
-  throw new Error('No active mail transporter');
+  // 🚀 Priority 3: Fallback SMTP Port 587
+  if (fallbackTransporter) {
+    const fInfo = await fallbackTransporter.sendMail(mailOptions);
+    return { success: true, messageId: fInfo.messageId, provider: 'smtp-587' };
+  }
+
+  throw new Error('All email delivery methods failed');
 }
 
 /**

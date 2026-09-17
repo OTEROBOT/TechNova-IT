@@ -19,6 +19,7 @@
     "express-session": "^1.19.0",
     "multer": "^2.2.0",
     "nodemailer": "^9.0.5",
+    "resend": "^6.28.1",
     "sql.js": "^1.14.2"
   }
 }
