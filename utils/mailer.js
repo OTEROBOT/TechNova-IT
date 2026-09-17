@@ -175,18 +175,32 @@ async function executeSendMail(mailOptions) {
  */
 function isTestOrDummyEmail(email) {
   if (!email || typeof email !== 'string') return true;
+  const clean = email.trim().toLowerCase();
+  if (clean.includes('test_') || clean.includes('dummy') || clean.includes('fake') || clean.includes('example_')) {
+    return true;
+  }
   const dummyDomains = [
     'technova.com',
     'technova-store.com',
     'technova-test.com',
     'example.com',
     'test.com',
+    'test.local',
+    'local',
     'domain.com',
     'localhost',
     'dummy.com',
+    'invalid',
   ];
-  const domain = email.split('@')[1]?.toLowerCase();
-  return dummyDomains.includes(domain) || process.env.NODE_ENV === 'test';
+  const domain = clean.split('@')[1] || '';
+  return (
+    dummyDomains.includes(domain) ||
+    domain.endsWith('.local') ||
+    domain.endsWith('.test') ||
+    domain.endsWith('.invalid') ||
+    domain.endsWith('.example') ||
+    process.env.NODE_ENV === 'test'
+  );
 }
 
 /**
