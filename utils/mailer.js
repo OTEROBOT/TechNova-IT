@@ -32,6 +32,11 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder('ipv4first');
 }
 
+// Strict IPv4 DNS lookup to guarantee no IPv6 (ENETUNREACH) issues on Render containers
+function ipv4Lookup(hostname, options, callback) {
+  return dns.lookup(hostname, { family: 4, all: false }, callback);
+}
+
 // 1. ดึงค่า Config จากไฟล์ .env และกำจัดช่องว่าง (Whitespace) ออกจากรหัสผ่านอัตโนมัติ
 const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
 const gmailPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
@@ -45,34 +50,92 @@ const isConfigured =
   !gmailPassword.includes('your16digit') &&
   !gmailPassword.includes('xxxx');
 
-// 3. สร้างตัวส่งอีเมล (Transporter) พร้อม Direct SMTP Port 465 SSL และ Family 4 (IPv4)
-let transporter = null;
+// 3. สร้างตัวส่งอีเมล (Primary: Port 465 SSL | Fallback: Port 587 STARTTLS) พร้อม Strict IPv4
+let primaryTransporter = null;
+let fallbackTransporter = null;
+
 if (isConfigured) {
-  transporter = nodemailer.createTransport({
+  // Primary: Port 465 SSL with IPv4 Lookup
+  primaryTransporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 465,
-    secure: true, // บังคับใช้ SSL บน Port 465
-    family: 4, // 👈 บังคับใช้ IPv4 แก้ไขปัญหา ENETUNREACH (IPv6) บน Render Linux Container
+    secure: true,
+    lookup: ipv4Lookup, // 👈 บังคับใช้ IPv4 ผ่าน DNS lookup function
     auth: {
       user: GMAIL_USER,
       pass: gmailPassword,
     },
     tls: {
-      rejectUnauthorized: false, // ป้องกันปัญหา SSL Certificate Dropouts
+      rejectUnauthorized: false,
     },
-    connectionTimeout: 20000, // 20 seconds timeout
-    greetingTimeout: 20000,
-    socketTimeout: 20000,
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 15000,
+  });
+
+  // Fallback: Port 587 STARTTLS with IPv4 Lookup
+  fallbackTransporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    requireTLS: true,
+    lookup: ipv4Lookup, // 👈 บังคับใช้ IPv4 ผ่าน DNS lookup function
+    auth: {
+      user: GMAIL_USER,
+      pass: gmailPassword,
+    },
+    tls: {
+      rejectUnauthorized: false,
+    },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 15000,
   });
 
   // ตรวจสอบการเชื่อมต่อ SMTP บน Server Boot
-  transporter.verify((error, success) => {
+  primaryTransporter.verify((error) => {
     if (error) {
-      console.error('❌ Nodemailer Transporter Error:', error.message);
+      console.warn('⚠️ Nodemailer Primary (Port 465 SSL) notice:', error.message);
+      if (fallbackTransporter) {
+        fallbackTransporter.verify((fErr) => {
+          if (fErr) {
+            console.error('❌ Nodemailer Fallback (Port 587 STARTTLS) error:', fErr.message);
+          } else {
+            console.log('✅ Nodemailer Fallback Transporter is ready via Port 587 (IPv4 STARTTLS).');
+          }
+        });
+      }
     } else {
-      console.log('✅ Nodemailer Transporter is ready to send emails via Port 465 (SSL IPv4).');
+      console.log('✅ Nodemailer Transporter is ready to send emails via Port 465 (IPv4 SSL).');
     }
   });
+}
+
+// Unified Dispatcher with automatic Port 465 -> Port 587 IPv4 Fallback
+async function executeSendMail(mailOptions) {
+  if (!isConfigured) {
+    throw new Error('Email service is not configured');
+  }
+
+  // Attempt 1: Port 465 (SSL IPv4)
+  if (primaryTransporter) {
+    try {
+      return await primaryTransporter.sendMail(mailOptions);
+    } catch (primaryErr) {
+      console.warn(`⚠️ [Mailer] Primary Port 465 attempt failed (${primaryErr.message}). Retrying via Port 587 (IPv4 STARTTLS)...`);
+      if (fallbackTransporter) {
+        return await fallbackTransporter.sendMail(mailOptions);
+      }
+      throw primaryErr;
+    }
+  }
+
+  // Attempt 2: Fallback Port 587
+  if (fallbackTransporter) {
+    return await fallbackTransporter.sendMail(mailOptions);
+  }
+
+  throw new Error('No active mail transporter');
 }
 
 /**
@@ -118,7 +181,7 @@ async function sendNewsletterWelcomeEmail(toEmail) {
     return { simulated: true, toEmail: cleanEmail };
   }
 
-  if (!isConfigured || !transporter) {
+  if (!isConfigured || (!primaryTransporter && !fallbackTransporter)) {
     console.log('\n📧 [โหมดจำลอง - บันทึกอีเมลแล้ว]');
     console.log(`   ส่งอีเมลต้อนรับ Newsletter ไปยัง: ${cleanEmail}\n`);
     return { simulated: true, toEmail: cleanEmail };
@@ -284,7 +347,7 @@ async function sendNewsletterWelcomeEmail(toEmail) {
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await executeSendMail(mailOptions);
     console.log(`\n📬 [Mailer] Successfully sent Newsletter Welcome Email to ${cleanEmail} (Message ID: ${info.messageId})\n`);
     return { success: true, messageId: info.messageId };
   } catch (err) {
@@ -440,7 +503,7 @@ async function sendRegistrationWelcomeEmail(toEmail, userName, preferences = {})
     return { simulated: true, toEmail: cleanEmail, profile: showcase.profileLabel };
   }
 
-  if (!isConfigured || !transporter) {
+  if (!isConfigured || (!primaryTransporter && !fallbackTransporter)) {
     console.log('\n📧 [โหมดจำลอง - สมัครสมาชิกใหม่]');
     console.log(`   ส่งอีเมลต้อนรับการสมัครสมาชิกไปยัง: ${cleanEmail} (${displayName})\n`);
     return { simulated: true, toEmail: cleanEmail, profile: showcase.profileLabel };
@@ -600,7 +663,7 @@ async function sendRegistrationWelcomeEmail(toEmail, userName, preferences = {})
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await executeSendMail(mailOptions);
     console.log(`\n📬 [Mailer] Successfully sent Registration Welcome Email to ${cleanEmail} (Message ID: ${info.messageId})\n`);
     return { success: true, messageId: info.messageId, profile: showcase.profileLabel };
   } catch (err) {
@@ -617,7 +680,7 @@ async function sendRegistrationWelcomeEmail(toEmail, userName, preferences = {})
 async function sendResetPasswordEmail(toEmail, resetToken) {
   const resetLink = `${SITE_URL}/#/reset-password?token=${resetToken}`;
 
-  if (!isConfigured) {
+  if (!isConfigured || (!primaryTransporter && !fallbackTransporter)) {
     console.log('\n📧 [โหมดจำลอง - ยังไม่ได้ตั้งค่า Gmail ใน .env]');
     console.log(`   ลิงก์รีเซ็ตรหัสผ่านสำหรับ ${toEmail}:`);
     console.log(`   ${resetLink}\n`);
@@ -669,7 +732,7 @@ async function sendResetPasswordEmail(toEmail, resetToken) {
   };
 
   try {
-    await transporter.sendMail(mailOptions);
+    await executeSendMail(mailOptions);
     return { simulated: false, resetLink };
   } catch (err) {
     console.error('[Reset Password Mail Error]', err.message);
@@ -698,7 +761,7 @@ async function sendOrderConfirmationEmail({
   const customerName = name || 'VIP Client';
   const orderNum = `#TN-${String(orderId).padStart(5, '0')}`;
 
-  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || !transporter) {
+  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || (!primaryTransporter && !fallbackTransporter)) {
     console.log(`\n📧 [Email Simulation] Order Confirmation for ${cleanEmail} (Order: ${orderNum}, Total: ฿${total.toLocaleString()})`);
     return { simulated: true, toEmail: cleanEmail, orderId };
   }
@@ -833,7 +896,7 @@ async function sendOrderConfirmationEmail({
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await executeSendMail(mailOptions);
     console.log(`\n📬 [Mailer] Successfully sent Order Confirmation Email to ${cleanEmail} (${orderNum})`);
     return { success: true, messageId: info.messageId };
   } catch (err) {
@@ -862,7 +925,7 @@ async function sendOrderShippedEmail({
   const customerName = name || 'VIP Client';
   const orderNum = `#TN-${String(orderId).padStart(5, '0')}`;
 
-  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || !transporter) {
+  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || (!primaryTransporter && !fallbackTransporter)) {
     console.log(`\n📧 [Email Simulation] Order Shipped for ${cleanEmail} (Order: ${orderNum}, Tracking: ${trackingNumber})`);
     return { simulated: true, toEmail: cleanEmail, orderId, trackingNumber };
   }
@@ -938,7 +1001,7 @@ async function sendOrderShippedEmail({
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await executeSendMail(mailOptions);
     console.log(`\n📬 [Mailer] Successfully sent Order Shipped Email to ${cleanEmail} (${orderNum})`);
     return { success: true, messageId: info.messageId };
   } catch (err) {
@@ -966,7 +1029,7 @@ async function sendCampaignEmail({
   const cleanEmail = toEmail.trim().toLowerCase();
   const recipientName = name || 'VIP Member';
 
-  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || !transporter) {
+  if (isTestOrDummyEmail(cleanEmail) || !isConfigured || (!primaryTransporter && !fallbackTransporter)) {
     console.log(`\n📧 [Campaign Simulation] To: ${cleanEmail} | Subject: "${subject}" | Tracking CTA: ${ctaTrackingUrl}`);
     return { simulated: true, toEmail: cleanEmail, subject };
   }
@@ -1037,7 +1100,7 @@ async function sendCampaignEmail({
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await executeSendMail(mailOptions);
     console.log(`\n📬 [Mailer] Successfully sent Campaign Email to ${cleanEmail}`);
     return { success: true, messageId: info.messageId };
   } catch (err) {
