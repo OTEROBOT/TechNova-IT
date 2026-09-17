@@ -25,6 +25,12 @@
  */
 
 const nodemailer = require('nodemailer');
+const dns = require('dns');
+
+// Force IPv4 DNS resolution across Node.js to resolve ENETUNREACH on Render Linux containers
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 // 1. ดึงค่า Config จากไฟล์ .env และกำจัดช่องว่าง (Whitespace) ออกจากรหัสผ่านอัตโนมัติ
 const GMAIL_USER = (process.env.GMAIL_USER || '').trim();
@@ -39,14 +45,14 @@ const isConfigured =
   !gmailPassword.includes('your16digit') &&
   !gmailPassword.includes('xxxx');
 
-// 3. สร้างตัวส่งอีเมล (Transporter) พร้อม SSL Port 465 และ Timeout สำหรับ Render / Cloud Hosting
+// 3. สร้างตัวส่งอีเมล (Transporter) พร้อม Direct SMTP Port 465 SSL และ Family 4 (IPv4)
 let transporter = null;
 if (isConfigured) {
   transporter = nodemailer.createTransport({
-    service: 'gmail',
     host: 'smtp.gmail.com',
     port: 465,
-    secure: true, // บังคับใช้ SSL บน Port 465 สำหรับ Cloud Hosting / Production
+    secure: true, // บังคับใช้ SSL บน Port 465
+    family: 4, // 👈 บังคับใช้ IPv4 แก้ไขปัญหา ENETUNREACH (IPv6) บน Render Linux Container
     auth: {
       user: GMAIL_USER,
       pass: gmailPassword,
@@ -54,9 +60,9 @@ if (isConfigured) {
     tls: {
       rejectUnauthorized: false, // ป้องกันปัญหา SSL Certificate Dropouts
     },
-    connectionTimeout: 15000, // 15 seconds timeout
-    greetingTimeout: 15000,
-    socketTimeout: 15000,
+    connectionTimeout: 20000, // 20 seconds timeout
+    greetingTimeout: 20000,
+    socketTimeout: 20000,
   });
 
   // ตรวจสอบการเชื่อมต่อ SMTP บน Server Boot
@@ -64,7 +70,7 @@ if (isConfigured) {
     if (error) {
       console.error('❌ Nodemailer Transporter Error:', error.message);
     } else {
-      console.log('✅ Nodemailer Transporter is ready to send emails via Port 465 (SSL).');
+      console.log('✅ Nodemailer Transporter is ready to send emails via Port 465 (SSL IPv4).');
     }
   });
 }
